@@ -1,0 +1,9 @@
+
+- Initial visualisation
+- Fix the data
+- View the data + interesting correlations
+	- race vs priori race
+	- race vs fleeing
+	- race vs armed
+
+- Generate confusion matrix to serch for other interesting correlations
