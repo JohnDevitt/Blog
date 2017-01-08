@@ -13,7 +13,7 @@ def main():
 
 	# Change dates to days
 	data['day'] = data.apply(lambda row: date_to_day(row['date']), axis = 1)
-	data.drop('date', axis=1, inplace=True)
+	data = data.drop('date', axis=1)
 
 	# Add additional useful features
 	features = ['Population', 'Density', 'TotalWages', 'Wealthy', 'Latitude', 'Longitude']
@@ -27,16 +27,16 @@ def main():
 
 	# Average wages is more informative than total wages
 	data['AverageWages'] = data.apply(lambda row: row['TotalWages']/row['Population'], axis = 1)
-	data.drop('TotalWages', axis = 1, inplace = True)
+	data = data.drop('TotalWages', axis = 1)
 
 	# Drop any rows with missing data
 	data = data.dropna()
 
 	# Also names and ids are not useful in this case
-	data.drop('name', axis = 1, inplace = True)
-	data.drop('id', axis = 1, inplace = True)
+	data = data.drop('name', axis = 1)
+	data = data.drop('id', axis = 1)
 
-	data.to_csv('data-police-shootings/fatal-police-shootings-data-modified.csv')
+	data.to_csv('data-police-shootings/fatal-police-shootings-data-modified.csv', index=False)
 
 
 def date_to_day(date_string) :
