@@ -83,7 +83,7 @@ class policy(object) :
 
 	def update_weights() :
 		gradient = calculate_gradient(weights, expected_value)
-		return
+		return learning_rate * gradient * value
 
 	def calculate_gradient(self, weights, expected_value) :
 		return weights - expected_value
