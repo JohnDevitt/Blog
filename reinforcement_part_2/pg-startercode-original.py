@@ -2,6 +2,7 @@ import numpy as np, os
 os.environ["THEANO_FLAGS"]="device=cpu,floatX=float64"
 import theano, theano.tensor as T
 import gym
+from lasagne.updates import sgd, apply_momentum, rmsprop, nesterov_momentum
 
 def discount(x, gamma):
     """
@@ -68,7 +69,7 @@ def rmsprop_updates(grads, params, stepsize, rho=0.9, epsilon=1e-9):
         accum_new = rho * accum + (1 - rho) * grad ** 2
         updates.append((accum, accum_new))
         updates.append((param, param + (stepsize * grad / T.sqrt(accum_new + epsilon))))
-    return updates   
+    return updates
 
 class REINFORCEAgent(object):
 
@@ -81,45 +82,54 @@ class REINFORCEAgent(object):
         """
         Initialize your agent's parameters
         """
-        number_of_features = ob_space.shape[0]
-        number_of_actions = action_space.n
+        nO = ob_space.shape[0]
+        nA = action_space.n
         # Here are all the algorithm parameters. You can modify them by passing in keyword args
-        self.config = dict(episode_max_length=100, timesteps_per_batch=10000, number_of_iterations=100, 
-            gamma=1.0, stepsize=0.05, number_of_hidden_layer_nodes=20)
+        self.config = dict(episode_max_length=100, timesteps_per_batch=10000, n_iter=100,
+            gamma=1.0, stepsize=0.05, nhid=20)
         self.config.update(usercfg)
 
         # Symbolic variables for observation, action, and advantage
         # These variables stack the results from many timesteps--the first dimension is the timestep
-        observation = T.fmatrix()
-        action = T.ivector() 
-        advantage = T.fvector()
-
+        ob_no = T.fmatrix() # Observation
+        a_n = T.ivector() # Discrete action
+        adv_n = T.fvector() # Advantage
         def shared(arr):
             return theano.shared(arr.astype('float64'))
-        
-        hidden_layer_weights = shared(np.random.randn(number_of_features, 
-            self.config['number_of_hidden_layer_nodes']) / np.sqrt(number_of_features))
-        hidden_layer_biases = shared(np.zeros(self.config['number_of_hidden_layer_nodes']))
-        output_layer_weights = shared(1e-4*np.random.randn(self.config['number_of_hidden_layer_nodes'], number_of_actions))
-        output_layer_biases = shared(np.zeros(number_of_actions))
-        parameters = [hidden_layer_weights, hidden_layer_biases, output_layer_weights, output_layer_biases]
-        
-        neural_network_function = T.nnet.softmax(T.tanh(observation.dot(hidden_layer_weights) + hidden_layer_biases[None,:]).dot(output_layer_weights) + output_layer_biases[None,:])
-        number_of_timesteps = observation.shape[0]
-        
-        loss = T.log(neural_network_function[T.arange(number_of_timesteps), action]).dot(advantage) / number_of_timesteps
+        # Create weights of neural network with one hidden layer
+        W0 = shared(np.random.randn(nO,self.config['nhid'])/np.sqrt(nO))
+        b0 = shared(np.zeros(self.config['nhid']))
+        W1 = shared(1e-4*np.random.randn(self.config['nhid'],nA))
+        b1 = shared(np.zeros(nA))
+        params = [W0, b0, W1, b1]
+        # Action probabilities
+        prob_na = T.nnet.softmax(T.tanh(ob_no.dot(W0)+b0[None,:]).dot(W1) + b1[None,:])
+        N = ob_no.shape[0]
+        # Loss function that we'll differentiate to get the policy gradient
+        # Note that we've divided by the total number of timesteps
+        loss = T.log(prob_na[T.arange(N), a_n]).dot(adv_n) / N * - 1
         stepsize = T.fscalar()
-        gradients = T.grad(loss, parameters)
-        
-        updates = rmsprop_updates(gradients, parameters, stepsize)
-        self.update_network = theano.function([observation, action, advantage, stepsize], [], updates=updates, allow_input_downcast=True)
-        self.neural_network = theano.function([observation], neural_network_function, allow_input_downcast=True)
+        #grads = T.grad(loss, params)
+        # Perform parameter updates.
+        # I find that sgd doesn't work well
+        # updates = sgd_updates(grads, params, stepsize)
+        # updates = rmsprop_updates(grads, params, stepsize)
+
+        #updates_sgd = sgd(loss, params, learning_rate=0.0001)
+        #updates = apply_momentum(updates_sgd, params, momentum=0.9)
+
+        #updates = rmsprop(loss, params, learning_rate=1e-9, rho=0.9, epsilon=0.001)
+
+        updates = nesterov_momentum(loss, params, learning_rate=stepsize, momentum=0.9)
+
+        self.pg_update = theano.function([ob_no, a_n, adv_n, stepsize], [], updates=updates, allow_input_downcast=True, on_unused_input='ignore')
+        self.compute_prob = theano.function([ob_no], prob_na, allow_input_downcast=True, on_unused_input='ignore')
 
     def act(self, ob):
         """
         Choose an action.
         """
-        prob = self.neural_network(ob.reshape(1,-1))
+        prob = self.compute_prob(ob.reshape(1,-1))
         action = categorical_sample(prob)
         return action
 
@@ -127,30 +137,31 @@ class REINFORCEAgent(object):
         """
         Run learning algorithm
         """
-        config = self.config
-        for iteration in xrange(config["number_of_iterations"]) :
-            # Collect trajectories until we get timesteps_per_batch total timesteps 
-            trajectories = []
+        cfg = self.config
+        for iteration in xrange(cfg["n_iter"]):
+            # Collect trajectories until we get timesteps_per_batch total timesteps
+            trajs = []
             timesteps_total = 0
-            while timesteps_total < config["timesteps_per_batch"]:
-                traj = get_traj(self, env, config["episode_max_length"])
-                trajectories.append(traj)
+            while timesteps_total < cfg["timesteps_per_batch"]:
+                traj = get_traj(self, env, cfg["episode_max_length"])
+                trajs.append(traj)
                 timesteps_total += len(traj["reward"])
-            all_ob = np.concatenate([traj["ob"] for traj in trajectories])
+            all_ob = np.concatenate([traj["ob"] for traj in trajs])
             # Compute discounted sums of rewards
-            rets = [discount(traj["reward"], config["gamma"]) for traj in trajectories]
+            rets = [discount(traj["reward"], cfg["gamma"]) for traj in trajs]
             maxlen = max(len(ret) for ret in rets)
             padded_rets = [np.concatenate([ret, np.zeros(maxlen-len(ret))]) for ret in rets]
             # Compute time-dependent baseline
             baseline = np.mean(padded_rets, axis=0)
             # Compute advantage function
             advs = [ret - baseline[:len(ret)] for ret in rets]
-            all_action = np.concatenate([traj["action"] for traj in trajectories])
+            all_action = np.concatenate([traj["action"] for traj in trajs])
             all_adv = np.concatenate(advs)
+            all_rets = np.concatenate(rets)
             # Do policy gradient update step
-            self.update_network(all_ob, all_action, all_adv, config["stepsize"])
-            eprews = np.array([traj["reward"].sum() for traj in trajectories]) # episode total rewards
-            eplens = np.array([len(traj["reward"]) for traj in trajectories]) # episode lengths
+            self.pg_update(all_ob, all_action, all_adv, cfg["stepsize"])
+            eprews = np.array([traj["reward"].sum() for traj in trajs]) # episode total rewards
+            eplens = np.array([len(traj["reward"]) for traj in trajs]) # episode lengths
             # Print stats
             print "-----------------"
             print "Iteration: \t %i"%iteration
@@ -160,14 +171,13 @@ class REINFORCEAgent(object):
             print "MeanRew: \t %s +- %s"%(eprews.mean(), eprews.std()/np.sqrt(len(eprews)))
             print "MeanLen: \t %s +- %s"%(eplens.mean(), eplens.std()/np.sqrt(len(eplens)))
             print "-----------------"
-            if eprews.mean() > 100:
-                get_traj(self, env, config["episode_max_length"], render=True)
+            if eprews.mean() >= 250 :
+                get_traj(self, env, cfg["episode_max_length"], render=True)
 
 
 def main():
-    env = gym.make("CartPole-v1")
-    agent = REINFORCEAgent(env.observation_space, env.action_space, 
-        episode_max_length=2500, stepsize=1e-9, nid=20000, n_iter=100000000)
+    env = gym.make("CartPole-v0")
+    agent = REINFORCEAgent(env.observation_space, env.action_space, episode_max_length=250)
     agent.learn(env)
 
 if __name__ == "__main__":

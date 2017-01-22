@@ -2,97 +2,174 @@
 import gym
 import numpy as np
 import theano, theano.tensor as T
+from lasagne.updates import sgd, apply_momentum, rmsprop, nesterov_momentum
 
 class app(object) :
 
 	def __init__(self, environment_string) :
 		self.environment = gym.make(environment_string)
 
-	def generate_trajectory(self, policy, display, max_episode_length=500, max_trajectory_length=10000) :
+	def generate_trajectory(self, neural_network, trajectory_max_length,
+	episode_max_length, discount, display=False) :
 
-		trajectory = []
+		observations, actions, returns = [], [], []
+		number_of_timesteps = 0
 
-		while(len(trajectory_length) < max_trajectory_length) :
-			episode_data = self.run_episode(policy, display, max_episode_length)
-			episode_return = self.sum_of_discounted_rewards_objective_function(episode_data)
-			trajectory.append({'episode_data': episode_data, 'episode_return': episode_return})
+		while(number_of_timesteps < trajectory_max_length) :
 
-		return trajectory
+			episode = self.run_episode(neural_network, display,
+			episode_max_length, discount)
 
-	def run_episode(self, policy, display, max_episode_length=500) :
+			number_of_timesteps += len(episode[0])
+			observations.append(episode[0])
+			actions.append(episode[1])
+			returns.append(episode[2])
 
-		episode_data = []
-		observation = self.environment.reset()
-		
-		for _ in range(max_episode_length) :
-			action = policy.pick_action(observation)
-			observation, reward, done, _ = self.environment.step(timestep_data['action'])
-			episode_data.append({'observation': observation, 'action': action, 'reward': reward})
-			if display : env.render()
+		advantages = self.compute_advantages(returns)
+
+		all_observations = np.concatenate([observation for observation in observations])
+		all_actions = np.concatenate([action for action in actions])
+		all_advantages = np.concatenate([advantage for advantage in advantages])
+		all_returns = np.concatenate([return_list for return_list in returns])
+
+
+		return [all_observations, all_actions, all_advantages, all_returns]
+
+	def run_episode(self, neural_network, display, episode_max_length, discount) :
+
+		observations, rewards, actions = [], [], []
+		observation = np.array(self.environment.reset())
+
+		for _ in range(episode_max_length) :
+
+			action = np.argmax(neural_network(observation.reshape(1, -1)))
+
+			observation_raw, reward, done, _ = self.environment.step(action)
+			observation = np.array(observation_raw)
+
+			observations.append(observation)
+			rewards.append(reward)
+			actions.append(action)
+
+			if display : self.environment.render()
 			if done: break
 
-		return trajectory
+		discounted_returns = self.sum_of_discounted_rewards(rewards, discount)
+		return [np.matrix(observations), np.array(actions), discounted_returns]
 
-	def sum_of_discounted_rewards_objective_function(self, episode_data, discount_rate=1) :
-		return sum([timestep_data['reward'] * pow(discount_rate, timestep) for timestep, timestep_data in enumerate(episode_data)])
+	def sum_of_discounted_rewards(self, rewards, discount) :
 
-	def train(self, policy, number_of_training_iterations=1000000) :
+		out = np.zeros(len(rewards), 'float64')
+		out[-1] = rewards[-1]
+		for i in reversed(xrange(len(rewards)-1)):
+			out[i] = rewards[i] + discount*out[i+1]
+		return out
 
-		for episode_index in xrange(number_of_training_iterations) :
-			trajectory = self.generate_trajectory(policy, False)
-			policy.neural_net_update(trajectory)
+	def compute_advantages(self, returns) :
+
+		padded_returns_lists = []
+		longest_episode_length = len(max(returns, key=len))
+
+		for returns_list in returns:
+			length_difference = longest_episode_length - len(returns_list)
+			zeros = np.zeros(length_difference)
+			padded_returns_lists.append(np.concatenate([returns_list, zeros]))
+
+		baseline = np.mean(padded_returns_lists, axis=0)
+
+		advantages = []
+		for returns_list in returns :
+			advantages.append(returns_list - baseline[:len(returns_list)])
+
+		return advantages
+
+	def train(self, neural_network, network_update, number_of_training_iterations,
+		trajectory_max_length, episode_max_length, learning_rate, discount) :
+
+		for trajectory_count in xrange(number_of_training_iterations) :
+
+			trajectory = self.generate_trajectory(neural_network, trajectory_max_length,
+			episode_max_length, discount)
+
+			network_update(trajectory[0], trajectory[1], trajectory[2], learning_rate)
+
+			if np.mean(trajectory[2]) >= 200 :
+				self.run_episode(neural_network=neural_network, display=True, episode_max_length=300, discount=discount)
+
+			print "------------------------------------------------------------------"
+			print 'Trajectory number: '                   + str(trajectory_count + 1)
+			print 'Average return over this trajectory: ' + str(np.mean(trajectory[3]))
+			print 'Variance over this trajectory:       ' + str(np.std(trajectory[3]))
+			print "------------------------------------------------------------------"
 
 
-class neural_network(object) :
+class neural_network_builder(object) :
 
-	def __init__(self, number_of_features, number_of_actions, number_of_hidden_nodes=200) :
+	def __init__(self, number_of_features, number_of_actions, number_of_hidden_nodes) :
 
 		self.number_of_features = number_of_features
 		self.number_of_actions = number_of_actions
 		self.number_of_hidden_nodes = number_of_hidden_nodes
 
-		self.hidden_layer_weights = shared(np.random.randn(number_of_features, number_of_hidden_nodes) / np.sqrt(number_of_features))
-		self.hidden_layer_biases = shared(np.zeros(number_of_hidden_nodes))
-		self.output_layer_weights = shared(learning_rate * np.random.randn(number_of_hidden_nodes ,number_of_actions))
-		self.output_layer_biases = shared(np.zeros(number_of_actions))
+		self.hidden_layer_weights = self.shared(np.random.randn(number_of_features, number_of_hidden_nodes) / np.sqrt(number_of_features))
+		self.hidden_layer_biases = self.shared(np.zeros(number_of_hidden_nodes))
+		self.output_layer_weights = self.shared(np.random.randn(number_of_hidden_nodes, number_of_actions) / np.sqrt(number_of_actions))
+		self.output_layer_biases = self.shared(np.zeros(number_of_actions))
 
-		self.parameters = [hidden_layer_weights, hidden_layer_biases, output_layer_weights, output_layer_biases]
+		self.parameters = [self.hidden_layer_weights,
+						   self.hidden_layer_biases,
+						   self.output_layer_weights,
+						   self.output_layer_biases]
 
-	def neural_net_update(self, number_of_actions, actions, advantages, stepsize, rho=0.9, epsilon=1e-9) :
+	def build_neural_network(self) :
+		observations        = T.fmatrix()
+		actions             = T.ivector()
+		advantages          = T.ivector()
+		learning_rate       = T.scalar()
+		number_of_timesteps = observations.shape[0]
 
-		loss = T.log(self.neural_net_query[number_of_actions, actions]).dot(advantages) / number_of_actions
-		gradients = T.grad(loss, params)
+		neural_net_query_function = T.nnet.softmax((T.tanh(observations.dot(self.hidden_layer_weights) + self.hidden_layer_biases[None,:])).dot(self.output_layer_weights) + self.output_layer_biases[None,:])
 
-		updates = []
+		loss = T.log(neural_net_query_function[T.arange(number_of_timesteps), actions]).dot(advantages) / number_of_timesteps
 
-		for parameter, gradient in zip(self.parameters, gradients):
-			accumulated_gradient_current = np.zeros(parameter.get_value(borrow=True).shape, dtype=parameter.dtype)
-			accumulated_gradient_new = rho * accumulated_gradient_current + (1 - rho) * gradient ** 2
-			updates.append((accumulated_gradient_current, accumulated_gradient_new))
-			updates.append((parameter, parameter + (stepsize * gradient / T.sqrt(accumulated_gradient_current + epsilon))))
-		return updates
+		#updates_sgd = sgd(loss, self.parameters, learning_rate=learning_rate)
+		updates = nesterov_momentum(loss, self.parameters, learning_rate=learning_rate, momentum=0.9)
 
-	def neural_net_query(self, observation) :
-		hidden_layer_values = T.tanh(observation.dot(self.hidden_layer_weights) + self.hidden_layer_biases[None,:])
-		output_layer_values = hidden_layer_values.dot(output_layer_weights) + output_layer_biases[None,:]
-		return T.nnet.softmax(output_layer_values)
+		network_update = theano.function([observations, actions, advantages, learning_rate], [],
+			updates=updates, allow_input_downcast=True, on_unused_input='ignore')
+		neural_network = theano.function([observations], neural_net_query_function, allow_input_downcast=True,
+			on_unused_input='ignore')
 
-	def take_action(self, observation) :
-		action_probabilities = self.neural_net_query(observation)
-		return action_probabilities.index(max(action_probabilities))
+		return network_update, neural_network
 
-		
+	def shared(self, arr):
+		return theano.shared(arr.astype('float64'))
+
+
 
 if __name__ == "__main__":
-	
-	environment_string = 'CartPole-v0'
-	learning_rate = 1e-4
 
+	environment_string = 'CartPole-v0'
 
 	app = app(environment_string)
-	number_of_actions = app.environment.action_space.n
+
+	# Parameter definitons
 	number_of_features = len(app.environment.observation_space.high)
+	number_of_actions = app.environment.action_space.n
+	number_of_hidden_nodes = 20
+	number_of_training_iterations = 100
+	trajectory_max_length = 10000
+	episode_max_length = 100
+	learning_rate = 0.5
+	discount      = 1
 
-	policy = policy(learning_rate, number_of_actions, number_of_features)
-	app.train(policy)
+	neural_network_builder = neural_network_builder(number_of_features=number_of_features,
+		number_of_actions=number_of_actions, number_of_hidden_nodes=number_of_hidden_nodes)
 
+	network_update, neural_network = neural_network_builder.build_neural_network()
+
+	app.train(neural_network=neural_network, network_update=network_update,
+		number_of_training_iterations=number_of_training_iterations,
+		trajectory_max_length=trajectory_max_length,
+		episode_max_length=episode_max_length, learning_rate=learning_rate,
+		discount=discount)
